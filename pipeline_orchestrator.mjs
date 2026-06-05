@@ -1,8 +1,13 @@
-﻿/**
+/**
  * Continuous Parallel Content Orchestrator
- * 
+ *
  * Master script that spawns a single Gemini Playwright session,
  * and runs Text Generation and Media Generation in parallel loops.
+ *
+ * Hardening (v2):
+ *  - try...finally in startMediaWorker guarantees browser handle cleanup
+ *  - Fatal vs. transient error taxonomy: fatal errors terminate the process
+ *    cleanly so the process monitor can restart from a known-good state
  */
 
 import { createGeminiBrowser } from './gemini_browser.mjs';
@@ -10,15 +15,30 @@ import { generateDayContent } from './content_generator.mjs';
 import { processMissingMedia } from './generate_missing_notion_media.mjs';
 import { fetchExistingDates } from './publish_to_notion.mjs';
 
-async function sleep(ms) {
+function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Global flag to tell Worker 2 when Worker 1 is completely finished
+// Signals to Worker 2 that Worker 1 has finished all days
 let textWorkerDone = false;
 
+// ─── Fatal error detector ─────────────────────────────────────────────────────
+// Errors that indicate misconfiguration / missing env — no point retrying.
+function isFatalError(err) {
+    const msg = err?.message?.toLowerCase() || '';
+    return (
+        msg.includes('cannot find module') ||
+        msg.includes('missing env') ||
+        msg.includes('enoent') ||
+        msg.includes('unauthorized') ||
+        msg.includes('forbidden')
+    );
+}
+
+// ─── Worker 1: Text Generation ───────────────────────────────────────────────
+
 async function startTextWorker(gem, daysAhead, targetVideos, targetImages) {
-    console.log('\n[Worker 1] ðŸš€ Text Generator started.');
+    console.log('\n[Worker 1] 🚀 Text Generator started.');
     try {
         const existingDateList = await fetchExistingDates();
         const existingDates = new Set(existingDateList);
@@ -26,42 +46,71 @@ async function startTextWorker(gem, daysAhead, targetVideos, targetImages) {
         for (let i = 0; i < daysAhead; i++) {
             const targetDate = new Date();
             targetDate.setDate(targetDate.getDate() + i + 1);
-            
-            console.log(`\n[Worker 1] ðŸ“ Processing Day ${i+1}/${daysAhead} - ${targetDate.toISOString().split('T')[0]}`);
-            
+
+            console.log(`\n[Worker 1] 📝 Processing Day ${i + 1}/${daysAhead} - ${targetDate.toISOString().split('T')[0]}`);
+
             // Jitter to prevent exact simultaneous prompts
             await sleep(Math.random() * 2000);
-            
+
             const quotas = { remainingVideos: targetVideos, remainingImages: targetImages };
             await generateDayContent(targetDate, gem, existingDates, quotas, i + 1, null, null);
-            
-            console.log(`[Worker 1] âœ… Completed Day ${i+1}.`);
+
+            console.log(`[Worker 1] ✅ Completed Day ${i + 1}.`);
         }
     } catch (e) {
-        console.error('[Worker 1] âŒ Crashed:', e);
+        if (isFatalError(e)) {
+            console.error('[Worker 1] 💀 Fatal error — terminating process:', e.message);
+            process.exit(1);
+        }
+        console.error('[Worker 1] ❌ Transient crash (will not retry automatically):', e.message);
     }
-    console.log('[Worker 1] ðŸŽ‰ Text Generation Complete.');
+    console.log('[Worker 1] 🎉 Text Generation Complete.');
     textWorkerDone = true;
 }
 
+// ─── Worker 2: Media Generation ──────────────────────────────────────────────
+
 async function startMediaWorker(gem) {
-    console.log('\n[Worker 2] ðŸŽ¨ Media Generator started.');
-    // Run an infinite loop polling Notion for missing media every 30 seconds
-    // until the text worker is fully done. We do one final loop after text is done to catch the last items.
+    console.log('\n[Worker 2] 🎨 Media Generator started.');
     let finalRun = false;
-    
+
     while (true) {
+        // ── try...finally guarantees resource cleanup on any exit path ──
         try {
             await sleep(Math.random() * 2000 + 5000); // jitter
-            await processMissingMedia(gem.context);
+
+            // processMissingMedia opens browser handles — finally ensures they close
+            let mediaContext = null;
+            try {
+                mediaContext = gem.context;
+                await processMissingMedia(mediaContext);
+            } finally {
+                // If processMissingMedia left any dangling page handles, close them.
+                // (Defensive: the function should handle its own cleanup, but this
+                //  catches cases where it throws mid-allocation.)
+                if (mediaContext) {
+                    try {
+                        const pages = mediaContext.pages();
+                        for (const page of pages) {
+                            if (page.url() === 'about:blank') {
+                                await page.close().catch(() => { });
+                            }
+                        }
+                    } catch { /* best-effort cleanup */ }
+                }
+            }
         } catch (e) {
-            console.error('[Worker 2] âŒ Error during media processing:', e);
+            if (isFatalError(e)) {
+                console.error('[Worker 2] 💀 Fatal error — terminating process:', e.message);
+                process.exit(1);
+            }
+            console.error('[Worker 2] ❌ Error during media processing (will retry):', e.message);
         }
-        
+
         if (finalRun) {
-            break; // Exit the loop if we just did the final sweep
+            break; // Exit after the final sweep
         }
-        
+
         if (textWorkerDone) {
             console.log('[Worker 2] Text Worker is done! Doing one final sweep for missing media...');
             finalRun = true;
@@ -69,11 +118,13 @@ async function startMediaWorker(gem) {
             continue;
         }
 
-        console.log('[Worker 2] â³ Waiting 25 seconds before next poll...');
-        await sleep(25000);
+        console.log('[Worker 2] ⏳ Waiting 25 seconds before next poll...');
+        await sleep(25_000);
     }
-    console.log('[Worker 2] ðŸŽ‰ Media Generation Loop Ended.');
+    console.log('[Worker 2] 🎉 Media Generation Loop Ended.');
 }
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
     const args = process.argv.slice(2);
@@ -81,33 +132,29 @@ async function main() {
     const targetVideos = parseInt(args[1]) || 2;
     const targetImages = parseInt(args[2]) || 33;
 
-    console.log(`\n=================================================`);
-    console.log(`ðŸš€ BLUEJAX CONTINUOUS ORCHESTRATOR`);
-    console.log(`=================================================`);
-    console.log(`Config: ${daysAhead} days ahead`);
+    console.log('\n=================================================');
+    console.log('🚀 BLUEJAX CONTINUOUS ORCHESTRATOR');
+    console.log('=================================================');
+    console.log(`Config: ${daysAhead} days ahead | ${targetVideos} videos | ${targetImages} images`);
 
-    // 1. Initialize Single Browser Instance
     console.log('\nBooting Gemini Engine...');
     const gem = await createGeminiBrowser();
 
-    // 2. Start Parallel Workers
     console.log('\nStarting Parallel Workers (Text + Media)...');
-    
-    // We run both promises simultaneously
     await Promise.all([
         startTextWorker(gem, daysAhead, targetVideos, targetImages),
         startMediaWorker(gem)
     ]);
 
     console.log('\n=================================================');
-    console.log('âœ… ORCHESTRATOR PIPELINE COMPLETE');
+    console.log('✅ ORCHESTRATOR PIPELINE COMPLETE');
     console.log('=================================================\n');
+
     await gem.close();
     process.exit(0);
 }
 
 main().catch(e => {
-    console.error('Fatal Pipeline Error:', e);
+    console.error('💥 Fatal Pipeline Error:', e.message);
     process.exit(1);
 });
-
